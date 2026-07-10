@@ -45,12 +45,17 @@ CURSOR_INJECTION_RE = re.compile(
     re.DOTALL,
 )
 CURSOR_KEEP_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
-# Codex：AGENTS.md 前言 + 指令/环境/技能注入块。
+# Codex：AGENTS.md 前言 + 指令/环境/技能/插件推荐注入块。
 CODEX_INJECTION_RE = re.compile(
-    r"<(INSTRUCTIONS|environment_context|skill|user_instructions)>.*?</\1>",
+    r"<(INSTRUCTIONS|environment_context|skill|user_instructions"
+    r"|recommended_plugins|turn_aborted)>.*?</\1>",
     re.DOTALL,
 )
-CODEX_PREAMBLE_RE = re.compile(r"^#\s*AGENTS\.md instructions\s*", re.IGNORECASE)
+# 「# AGENTS.md instructions」头行，可能带「for /path」后缀，且新版 Codex 会把它
+# 放在 recommended_plugins 块之后而非字符串开头，用 MULTILINE 整行剥离。
+CODEX_PREAMBLE_RE = re.compile(
+    r"^#\s*AGENTS\.md instructions.*$", re.IGNORECASE | re.MULTILINE
+)
 
 
 # ============================ 环境判断 ============================
