@@ -106,7 +106,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd /Users/lvzhibo/Agent/MySkill/session-digest && python3 -m unittest tests.test_grok_pi -v`  
+Run: `cd /Users/lvzhibo/Agent/MySkill/session-digest && python3 -m unittest tests.test_grok_pi -v`
 Expected: FAIL（`load_grok` / `load_pi` / `enc_*` 不存在）
 
 - [ ] **Step 3: 实现常量、编码、剥离、loader、发现、detect、接线**
@@ -143,7 +143,7 @@ def enc_pi(path: str) -> str:
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `python3 -m unittest tests.test_grok_pi -v`  
+Run: `python3 -m unittest tests.test_grok_pi -v`
 Expected: OK
 
 - [ ] **Step 5: 对本机真实会话做冒烟**
@@ -193,7 +193,7 @@ EOF
 
 - [ ] **Step 3: 对照验证**
 
-Run: `python3 session_digest.py --help`  
+Run: `python3 session_digest.py --help`
 Expected: choices 含 grok/pi。
 
 - [ ] **Step 4: Commit**
@@ -235,7 +235,7 @@ Expected: 无报错；摘要无 system/thinking；Grok 无整块 user_info；ful
 
 - [ ] **Step 2: 全量 unittest**
 
-Run: `python3 -m unittest tests.test_grok_pi -v`  
+Run: `python3 -m unittest tests.test_grok_pi -v`
 Expected: OK
 
 - [ ] **Step 3: 若有热修则另开 commit；否则完成**

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ class TestLoadGrok(unittest.TestCase):
                         "text": (
                             "<user_info>x</user_info>\n"
                             "<system-reminder>noise</system-reminder>\n"
+                            "<skill_information><user_query>injected</user_query></skill_information>\n"
                             "<user_query>\nhello\n</user_query>"
                         ),
                     }
@@ -45,6 +47,13 @@ class TestLoadGrok(unittest.TestCase):
                 ],
             },
             {"type": "tool_result", "tool_call_id": "c1", "content": "ok"},
+            {
+                "type": "backend_tool_call",
+                "kind": {
+                    "tool_type": "web_search",
+                    "action": {"type": "search", "query": "needle"},
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "chat_history.jsonl"
@@ -61,12 +70,15 @@ class TestLoadGrok(unittest.TestCase):
         self.assertNotIn("user_info", user_text)
         self.assertNotIn("system-reminder", user_text)
         self.assertNotIn("noise", user_text)
+        self.assertNotIn("injected", user_text)
         types = [b["type"] for b in turns[1]["blocks"]]
         self.assertIn("tool_use", types)
         self.assertIn("tool_result", types)
         tool = next(b for b in turns[1]["blocks"] if b["type"] == "tool_use")
         self.assertEqual(tool["name"], "read_file")
         self.assertEqual(tool["input"]["target_file"], "a.py")
+        web = next(b for b in turns[1]["blocks"] if b.get("name") == "web_search")
+        self.assertEqual(web["input"]["query"], "needle")
 
 
 class TestLoadPi(unittest.TestCase):
@@ -139,6 +151,23 @@ class TestProjectEnc(unittest.TestCase):
         path = "/Users/me/Agent/Foo"
         self.assertEqual(sd.enc_pi(path), "--Users-me-Agent-Foo--")
         self.assertEqual(sd.enc_grok(path), quote(path, safe=""))
+
+
+class TestResolveSessionCli(unittest.TestCase):
+    def test_path_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            roots = {"grok": root / "grok", "pi": root / "pi"}
+            chat = roots["grok"] / "project/session/chat_history.jsonl"
+            chat.parent.mkdir(parents=True)
+            chat.write_text("", encoding="utf-8")
+            other = root / "other"
+            other.mkdir()
+            with mock.patch.multiple(sd, GROK_SESSIONS=roots["grok"], SOURCE_ROOTS=roots):
+                with self.assertRaisesRegex(SystemExit, "允许来源 pi"):
+                    sd.resolve_session(str(chat), ("pi",))
+                with self.assertRaisesRegex(SystemExit, "仅支持 Grok 会话目录"):
+                    sd.resolve_session(str(other), ("grok",))
 
 
 if __name__ == "__main__":

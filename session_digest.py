@@ -72,7 +72,8 @@ CODEX_PREAMBLE_RE = re.compile(
 # Grok：环境注入块；user_query 内是真实提问，单独保留。
 GROK_INJECTION_RE = re.compile(
     r"<(system-reminder|user_info|git_status|manually_attached_skills|timestamp"
-    r"|additional_data|attached_files|current_file|available_instructions)>.*?</\1>",
+    r"|additional_data|attached_files|current_file|available_instructions"
+    r"|skill_information)>.*?</\1>",
     re.DOTALL,
 )
 GROK_KEEP_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
@@ -122,6 +123,7 @@ def strip_text(text: str, source: str, role: str) -> str:
     if source == "cursor":
         return _strip(text, CURSOR_INJECTION_RE, CURSOR_KEEP_RE)
     if source == "grok" and role == "user":
+        text = GROK_INJECTION_RE.sub("", text)
         return _strip(text, GROK_INJECTION_RE, GROK_KEEP_RE)
     if source == "codex" and role == "user":
         return _strip(CODEX_PREAMBLE_RE.sub("", text), CODEX_INJECTION_RE, None)
@@ -392,7 +394,7 @@ def load_grok(path: Path) -> list[dict]:
                     {
                         "type": "tool_use",
                         "name": kind.get("name") or kind.get("tool_type") or "backend_tool",
-                        "input": _parse_tool_args(kind.get("input")),
+                        "input": _parse_tool_args(kind.get("input") or kind.get("action")),
                     }
                 )
     flush()
@@ -611,6 +613,8 @@ def resolve_session(sid: str, scope: tuple[str, ...]) -> tuple[str, Path]:
     """按 id 或路径跨来源定位唯一会话，多命中则列出并退出。"""
     p = Path(os.path.expanduser(sid))
     if p.is_dir():
+        if not p.resolve().is_relative_to(GROK_SESSIONS.resolve()):
+            sys.exit(f"仅支持 Grok 会话目录: {p}")
         chat = p / "chat_history.jsonl"
         if chat.is_file():
             p = chat
@@ -620,6 +624,8 @@ def resolve_session(sid: str, scope: tuple[str, ...]) -> tuple[str, Path]:
         for src, root in SOURCE_ROOTS.items():
             try:
                 p.resolve().relative_to(root.resolve())
+                if src not in scope:
+                    sys.exit(f"会话文件属于来源 {src}，允许来源 {', '.join(scope)}: {p}")
                 return (src, p)
             except ValueError:
                 continue
