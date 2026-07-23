@@ -76,7 +76,7 @@ CLI 来源名：`grok`、`pi`（不用 `gro` 简写）。
 读 `chat_history.jsonl`：
 
 - 丢弃：`system`、`reasoning`
-- `user`：content 为 str 或 `[{type:text}]`；剥离 `<user_info>` / `<git_status>` 等注入；保留 `<user_query>` 内正文
+- `user`：content 为 str 或 `[{type:text}]`；剥离 `<system-reminder>` / `<user_info>` / `<git_status>` 等注入；保留 `<user_query>` 内正文
 - `assistant`：文本 + `tool_calls[]` → `tool_use`（arguments 为 JSON 字符串则 parse）
 - `tool_result` → `tool_result`；`backend_tool_call` → `tool_use`（name 取 `kind.name`）
 - 相邻同 role 合并为同一 turn（ensure 模式）
