@@ -26,6 +26,7 @@ class TestLoadGrok(unittest.TestCase):
                         "type": "text",
                         "text": (
                             "<user_info>x</user_info>\n"
+                            "<system-reminder>noise</system-reminder>\n"
                             "<user_query>\nhello\n</user_query>"
                         ),
                     }
@@ -58,6 +59,8 @@ class TestLoadGrok(unittest.TestCase):
         )
         self.assertIn("hello", user_text)
         self.assertNotIn("user_info", user_text)
+        self.assertNotIn("system-reminder", user_text)
+        self.assertNotIn("noise", user_text)
         types = [b["type"] for b in turns[1]["blocks"]]
         self.assertIn("tool_use", types)
         self.assertIn("tool_result", types)

@@ -71,8 +71,8 @@ CODEX_PREAMBLE_RE = re.compile(
 )
 # Grok：环境注入块；user_query 内是真实提问，单独保留。
 GROK_INJECTION_RE = re.compile(
-    r"<(user_info|git_status|manually_attached_skills|timestamp|additional_data"
-    r"|attached_files|current_file|available_instructions)>.*?</\1>",
+    r"<(system-reminder|user_info|git_status|manually_attached_skills|timestamp"
+    r"|additional_data|attached_files|current_file|available_instructions)>.*?</\1>",
     re.DOTALL,
 )
 GROK_KEEP_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
