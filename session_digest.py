@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""会话摘要：把 Claude Code / Codex / Cursor 会话压成可读 Markdown。
+"""会话摘要：把 Claude Code / Codex / Cursor / Grok / Pi 会话压成可读 Markdown。
 
-三个来源归一化到同一套 turn 结构后共用一个渲染器：
+多家来源归一化到同一套 turn 结构后共用一个渲染器：
 - Claude Code：~/.claude/projects/<编码路径>/<id>.jsonl
 - Codex     ：~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 - Cursor    ：~/.cursor/projects/<编码路径>/agent-transcripts/<id>/<id>.jsonl
+- Grok      ：~/.grok/sessions/<URL编码cwd>/<id>/chat_history.jsonl
+- Pi        ：~/.pi/agent/sessions/--<path>--/<ts>_<uuid>.jsonl
 
 剥离各来源的无效 ID 与系统/指令注入块，保留用户问题与 agent 回复，
 工具调用细节按 --tools 粒度保留。默认按当前运行环境自动判断查哪个来源。
@@ -18,13 +20,24 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 HOME = Path.home()
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CURSOR_PROJECTS = HOME / ".cursor" / "projects"
+GROK_HOME = Path(os.environ["GROK_HOME"]) if os.environ.get("GROK_HOME") else HOME / ".grok"
+GROK_SESSIONS = GROK_HOME / "sessions"
+PI_SESSIONS = HOME / ".pi" / "agent" / "sessions"
 
-SOURCES = ("claude", "codex", "cursor")
+SOURCES = ("claude", "codex", "cursor", "grok", "pi")
+SOURCE_ROOTS = {
+    "claude": CLAUDE_PROJECTS,
+    "codex": CODEX_SESSIONS,
+    "cursor": CURSOR_PROJECTS,
+    "grok": GROK_SESSIONS,
+    "pi": PI_SESSIONS,
+}
 TOOL_RESULT_TRUNC_LINES = 50
 CODEX_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -45,12 +58,25 @@ CURSOR_INJECTION_RE = re.compile(
     re.DOTALL,
 )
 CURSOR_KEEP_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
-# Codex：AGENTS.md 前言 + 指令/环境/技能注入块。
+# Codex：AGENTS.md 前言 + 指令/环境/技能/插件推荐注入块。
 CODEX_INJECTION_RE = re.compile(
-    r"<(INSTRUCTIONS|environment_context|skill|user_instructions)>.*?</\1>",
+    r"<(INSTRUCTIONS|environment_context|skill|user_instructions"
+    r"|recommended_plugins|turn_aborted)>.*?</\1>",
     re.DOTALL,
 )
-CODEX_PREAMBLE_RE = re.compile(r"^#\s*AGENTS\.md instructions\s*", re.IGNORECASE)
+# 「# AGENTS.md instructions」头行，可能带「for /path」后缀，且新版 Codex 会把它
+# 放在 recommended_plugins 块之后而非字符串开头，用 MULTILINE 整行剥离。
+CODEX_PREAMBLE_RE = re.compile(
+    r"^#\s*AGENTS\.md instructions.*$", re.IGNORECASE | re.MULTILINE
+)
+# Grok：环境注入块；user_query 内是真实提问，单独保留。
+GROK_INJECTION_RE = re.compile(
+    r"<(system-reminder|user_info|git_status|manually_attached_skills|timestamp"
+    r"|additional_data|attached_files|current_file|available_instructions"
+    r"|skill_information)>.*?</\1>",
+    re.DOTALL,
+)
+GROK_KEEP_RE = re.compile(r"<user_query>(.*?)</user_query>", re.DOTALL)
 
 
 # ============================ 环境判断 ============================
@@ -68,6 +94,10 @@ def detect_harness() -> str | None:
     if (e.get("CURSOR_AGENT") == "1" or e.get("CURSOR_TRACE_ID")
             or ai.startswith("cursor") or "cursor" in bundle):
         return "cursor"
+    if e.get("GROK_HOME") or e.get("GROK_AGENT") or ai.startswith("grok"):
+        return "grok"
+    if e.get("PI_CODING_AGENT") or ai.startswith("pi"):
+        return "pi"
     return None
 
 
@@ -92,6 +122,9 @@ def strip_text(text: str, source: str, role: str) -> str:
         return _strip(text, CLAUDE_INJECTION_RE, CLAUDE_KEEP_RE)
     if source == "cursor":
         return _strip(text, CURSOR_INJECTION_RE, CURSOR_KEEP_RE)
+    if source == "grok" and role == "user":
+        text = GROK_INJECTION_RE.sub("", text)
+        return _strip(text, GROK_INJECTION_RE, GROK_KEEP_RE)
     if source == "codex" and role == "user":
         return _strip(CODEX_PREAMBLE_RE.sub("", text), CODEX_INJECTION_RE, None)
     return text.strip() if isinstance(text, str) else ""
@@ -273,11 +306,191 @@ def load_codex(path: Path) -> list[dict]:
     return turns
 
 
+def _content_as_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+            elif isinstance(c, str):
+                parts.append(c)
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _parse_tool_args(args):
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except json.JSONDecodeError:
+            return {"raw": args}
+    return {} if args is None else {"raw": args}
+
+
+def load_grok(path: Path) -> list[dict]:
+    """Grok chat_history：system/reasoning 丢弃；user/assistant/tool 归组成 turn。"""
+    turns: list[dict] = []
+    cur: dict | None = None
+
+    def flush():
+        nonlocal cur
+        if cur and cur["blocks"]:
+            turns.append(cur)
+        cur = None
+
+    def ensure(role: str):
+        nonlocal cur
+        if cur is None or cur["role"] != role:
+            flush()
+            cur = {"role": role, "ts": "", "blocks": []}
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = o.get("type")
+            if t in ("system", "reasoning"):
+                continue
+            if t == "user":
+                text = strip_text(_content_as_text(o.get("content")), "grok", "user")
+                if text:
+                    ensure("user")
+                    cur["blocks"].append({"type": "text", "text": text})
+            elif t == "assistant":
+                ensure("assistant")
+                text = _content_as_text(o.get("content")).strip()
+                if text:
+                    cur["blocks"].append({"type": "text", "text": text})
+                for tc in o.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    cur["blocks"].append(
+                        {
+                            "type": "tool_use",
+                            "name": tc.get("name") or "?",
+                            "input": _parse_tool_args(tc.get("arguments")),
+                        }
+                    )
+            elif t == "tool_result":
+                ensure("assistant")
+                cur["blocks"].append(
+                    {"type": "tool_result", "content": o.get("content")}
+                )
+            elif t == "backend_tool_call":
+                kind = o.get("kind") or {}
+                if not isinstance(kind, dict):
+                    continue
+                ensure("assistant")
+                cur["blocks"].append(
+                    {
+                        "type": "tool_use",
+                        "name": kind.get("name") or kind.get("tool_type") or "backend_tool",
+                        "input": _parse_tool_args(kind.get("input") or kind.get("action")),
+                    }
+                )
+    flush()
+    return turns
+
+
+def load_pi(path: Path) -> list[dict]:
+    """Pi session JSONL：按行序读 message；thinking 丢弃；toolResult 并入 assistant。"""
+    turns: list[dict] = []
+    cur: dict | None = None
+
+    def flush():
+        nonlocal cur
+        if cur and cur["blocks"]:
+            turns.append(cur)
+        cur = None
+
+    def ensure(role: str):
+        nonlocal cur
+        if cur is None or cur["role"] != role:
+            flush()
+            cur = {"role": role, "ts": "", "blocks": []}
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if o.get("type") != "message":
+                continue
+            msg = o.get("message") or {}
+            role = msg.get("role")
+            ts = fmt_ts(o.get("timestamp", ""))
+            if role == "toolResult":
+                ensure("assistant")
+                if not cur.get("ts"):
+                    cur["ts"] = ts
+                cur["blocks"].append(
+                    {
+                        "type": "tool_result",
+                        "content": msg.get("content"),
+                        "is_error": bool(msg.get("isError")),
+                    }
+                )
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            blocks: list[dict] = []
+            content = msg.get("content")
+            if isinstance(content, str):
+                s = content.strip()
+                if s:
+                    blocks.append({"type": "text", "text": s})
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "text":
+                        s = (b.get("text") or "").strip()
+                        if s:
+                            blocks.append({"type": "text", "text": s})
+                    elif bt == "toolCall":
+                        blocks.append(
+                            {
+                                "type": "tool_use",
+                                "name": b.get("name") or "?",
+                                "input": b.get("arguments") or {},
+                            }
+                        )
+                    elif bt == "image":
+                        blocks.append({"type": "image"})
+                    # thinking 丢弃
+            if not blocks:
+                continue
+            ensure(role)
+            if not cur.get("ts"):
+                cur["ts"] = ts
+            cur["blocks"].extend(blocks)
+    flush()
+    return turns
+
+
 def load_turns(source: str, path: Path) -> list[dict]:
     if source == "claude":
         return _anthropic_turns(path, "claude", "type")
     if source == "cursor":
         return _anthropic_turns(path, "cursor", "role")
+    if source == "grok":
+        return load_grok(path)
+    if source == "pi":
+        return load_pi(path)
     return load_codex(path)
 
 
@@ -292,6 +505,16 @@ def enc(path: str, leading_dash: bool) -> str:
     return p if leading_dash else p.lstrip("-")
 
 
+def enc_grok(path: str) -> str:
+    """Grok 项目目录：路径做 URL 百分号编码（保留空 safe）。"""
+    return quote(path, safe="")
+
+
+def enc_pi(path: str) -> str:
+    """Pi 项目目录：/--a/b/c-- 形式，/ 替换为 -。"""
+    return "--" + path.strip("/").replace("/", "-") + "--"
+
+
 def iter_sessions(sources: tuple[str, ...]):
     """产出 (source, path, sid, mtime)；不读文件内容，按需再取 project。"""
     if "claude" in sources and CLAUDE_PROJECTS.is_dir():
@@ -304,14 +527,50 @@ def iter_sessions(sources: tuple[str, ...]):
     if "cursor" in sources and CURSOR_PROJECTS.is_dir():
         for p in CURSOR_PROJECTS.glob("*/agent-transcripts/*/*.jsonl"):
             yield ("cursor", p, p.stem, p.stat().st_mtime)
+    if "grok" in sources and GROK_SESSIONS.is_dir():
+        for p in GROK_SESSIONS.glob("*/*/chat_history.jsonl"):
+            yield ("grok", p, p.parent.name, p.stat().st_mtime)
+    if "pi" in sources and PI_SESSIONS.is_dir():
+        for p in PI_SESSIONS.glob("*/*.jsonl"):
+            m = CODEX_ID_RE.search(p.name)
+            yield ("pi", p, m.group(0) if m else p.stem, p.stat().st_mtime)
+
+
+def _grok_session_cwd(path: Path) -> str:
+    summary = path.parent / "summary.json"
+    try:
+        data = json.loads(summary.read_text(encoding="utf-8"))
+        cwd = (data.get("info") or {}).get("cwd") or ""
+        if cwd:
+            return cwd
+    except (OSError, json.JSONDecodeError):
+        pass
+    return unquote(path.parent.parent.name)
+
+
+def _pi_session_cwd(path: Path) -> str:
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                o = json.loads(line)
+                if o.get("type") == "session":
+                    return o.get("cwd") or ""
+                break
+    except (OSError, json.JSONDecodeError):
+        pass
+    return path.parent.name
 
 
 def session_project(source: str, path: Path) -> str:
-    """会话所属项目标签：claude/cursor 取编码目录名，codex 读 session_meta 的 cwd。"""
+    """会话所属项目标签。"""
     if source == "claude":
         return path.parent.name
     if source == "cursor":
         return path.parent.parent.parent.name
+    if source == "grok":
+        return _grok_session_cwd(path)
+    if source == "pi":
+        return _pi_session_cwd(path)
     try:
         with path.open(encoding="utf-8") as f:
             for line in f:
@@ -332,6 +591,10 @@ def project_matches(source: str, path: Path, target: str) -> bool:
             return label == enc(target, True)
         if source == "cursor":
             return label == enc(target, False)
+        if source == "grok":
+            return label == target or path.parent.parent.name == enc_grok(target)
+        if source == "pi":
+            return label == target or path.parent.name == enc_pi(target)
         return label == target
     return target in label
 
@@ -349,12 +612,20 @@ def resolve_scope(source_arg: str) -> tuple[str, ...]:
 def resolve_session(sid: str, scope: tuple[str, ...]) -> tuple[str, Path]:
     """按 id 或路径跨来源定位唯一会话，多命中则列出并退出。"""
     p = Path(os.path.expanduser(sid))
+    if p.is_dir():
+        if not p.resolve().is_relative_to(GROK_SESSIONS.resolve()):
+            sys.exit(f"仅支持 Grok 会话目录: {p}")
+        chat = p / "chat_history.jsonl"
+        if chat.is_file():
+            p = chat
+        else:
+            sys.exit(f"会话目录缺少 chat_history.jsonl: {p}")
     if p.is_file():
-        for src in SOURCES:
-            root = {"claude": CLAUDE_PROJECTS, "codex": CODEX_SESSIONS,
-                    "cursor": CURSOR_PROJECTS}[src]
+        for src, root in SOURCE_ROOTS.items():
             try:
-                p.relative_to(root)
+                p.resolve().relative_to(root.resolve())
+                if src not in scope:
+                    sys.exit(f"会话文件属于来源 {src}，允许来源 {', '.join(scope)}: {p}")
                 return (src, p)
             except ValueError:
                 continue
@@ -412,21 +683,24 @@ def digest(source: str, path: Path, tools: str, last: int, no_trunc: bool) -> st
     if last > 0:
         turns = turns[-last:]
     blocks = [md for md in (turn_to_md(t, tools, no_trunc) for t in turns) if md]
-    sid = CODEX_ID_RE.search(path.name)
-    sid = sid.group(0) if sid else path.stem
+    if source == "grok":
+        sid = path.parent.name
+    else:
+        m = CODEX_ID_RE.search(path.name)
+        sid = m.group(0) if m else path.stem
     return f"# 会话摘要 · [{source}] {sid}\n\n" + "\n\n".join(blocks) + "\n"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="session-digest",
-        description="把 Claude Code / Codex / Cursor 会话压成可读 Markdown。",
+        description="把 Claude Code / Codex / Cursor / Grok / Pi 会话压成可读 Markdown。",
     )
     ap.add_argument(
         "--source",
         choices=[*SOURCES, "auto", "all"],
         default="auto",
-        help="会话来源：auto 按当前环境自动判断(默认) / claude / codex / cursor / all 全部",
+        help="会话来源：auto 按当前环境自动判断(默认) / claude / codex / cursor / grok / pi / all 全部",
     )
     ap.add_argument("--list", nargs="?", type=int, const=20, metavar="N",
                     help="列出最近 N 条会话供选择（默认 20），不解析内容")
